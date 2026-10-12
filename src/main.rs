@@ -295,8 +295,8 @@ fn cmd_generate(
     temperature: f32,
     cpu: bool,
 ) -> Result<()> {
-    let device = util::pick_device(cpu)?;
-    let l = checkpoint::load(&model_dir, &device, candle_core::DType::F32)?;
+    let (device, _) = util::pick_device(cpu);
+    let l = checkpoint::load(&model_dir, &device)?;
     let tok = &l.tokenizer;
     let ids = if as_chat {
         chat::encode_chat(
@@ -329,6 +329,7 @@ fn cmd_generate(
     let mut rng = Rng::from_time();
     generate::generate(
         &l.model,
+        &device,
         &ids,
         &params,
         &mut rng,

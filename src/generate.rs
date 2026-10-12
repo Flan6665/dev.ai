@@ -3,7 +3,7 @@
 use crate::model::{KvCache, Model};
 use crate::util::Rng;
 use anyhow::Result;
-use candle_core::{DType, Tensor};
+use burn::prelude::{Device, Int, Tensor, TensorData};
 use serde::Deserialize;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -94,14 +94,21 @@ fn sample(
     idx[cut - 1] as u32
 }
 
-fn last_logits(logits: &Tensor) -> Result<Vec<f32>> {
-    let t = logits.dim(1)?;
-    Ok(logits
-        .narrow(1, t - 1, 1)?
-        .squeeze(1)?
-        .squeeze(0)?
-        .to_dtype(DType::F32)?
-        .to_vec1()?)
+fn last_logits(logits: Tensor<3>) -> Vec<f32> {
+    let [_, t, v] = logits.dims();
+    logits
+        .narrow(1, t - 1, 1)
+        .reshape([v])
+        .into_data()
+        .convert::<f32>()
+        .try_into_vec::<f32>()
+        .expect("логиты должны быть f32")
+}
+
+fn ids(v: &[u32], device: &Device) -> Tensor<2, Int> {
+    let v: Vec<i64> = v.iter().map(|&x| i64::from(x)).collect();
+    let n = v.len();
+    Tensor::from_data(TensorData::new(v, [1, n]), device)
 }
 
 /// Генерирует продолжение. `on_token` получает каждый новый токен и может
@@ -110,6 +117,7 @@ fn last_logits(logits: &Tensor) -> Result<Vec<f32>> {
 #[allow(clippy::too_many_arguments)]
 pub fn generate(
     model: &Model,
+    device: &Device,
     prompt: &[u32],
     p: &SamplingParams,
     rng: &mut Rng,
@@ -118,7 +126,7 @@ pub fn generate(
     think: Option<(u32, u32)>,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<Vec<u32>> {
-    let max_ctx = model.cfg.max_seq_len;
+    let max_ctx = model.max_seq_len();
     // Если промпт не влезает — оставляем конец (самое свежее).
     let keep = max_ctx.saturating_sub(p.max_tokens.min(max_ctx / 2)).max(1);
     let prompt = if prompt.len() > keep {
@@ -126,10 +134,8 @@ pub fn generate(
     } else {
         prompt
     };
-    let dev = model.device();
-    let mut cache = KvCache::new(model.cfg.n_layers);
-    let input = Tensor::new(prompt, dev)?.unsqueeze(0)?;
-    let mut logits = last_logits(&model.forward(&input, Some(&mut cache), false)?)?;
+    let mut cache = KvCache::new(model.n_layers());
+    let mut logits = last_logits(model.forward(ids(prompt, device), Some(&mut cache))?);
     let mut history = prompt.to_vec();
     let mut out = Vec::new();
     // 0 — размышления не начаты, 1 — идут, 2 — закончены.
@@ -164,8 +170,7 @@ pub fn generate(
         if !on_token(next) || cache.len() + 1 > max_ctx {
             break;
         }
-        let input = Tensor::new(&[next], dev)?.unsqueeze(0)?;
-        logits = last_logits(&model.forward(&input, Some(&mut cache), false)?)?;
+        logits = last_logits(model.forward(ids(&[next], device), Some(&mut cache))?);
     }
     Ok(out)
 }

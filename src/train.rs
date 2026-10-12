@@ -1,173 +1,73 @@
-//! Обучение: оптимизатор AdamW, шаг с накоплением градиентов, цикл с оценкой и сохранением.
+//! Обучение: AdamW, накопление градиентов, расписание lr, оценка и сохранение.
 
 use crate::checkpoint::{self, TrainState};
 use crate::data::{BatchSource, ChatData, TokenFile};
 use crate::model::{Model, lm_loss};
-use crate::util::{Rng, human_count, parse_dtype, pick_device};
-use anyhow::{Result, bail};
-use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::VarMap;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use crate::util::{Rng, human_count, pick_device};
+use anyhow::{Result, anyhow, bail};
+use burn::grad_clipping::GradientClippingConfig;
+use burn::module::Module;
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer};
+use burn::prelude::Device;
+use std::path::PathBuf;
 use std::time::Instant;
 
-pub struct AdamW {
-    names: Vec<String>,
-    vars: Vec<Var>,
-    m: Vec<Tensor>,
-    v: Vec<Tensor>,
-    pub t: usize,
-    beta1: f64,
-    beta2: f64,
-    eps: f64,
-    weight_decay: f64,
-}
-
-impl AdamW {
-    pub fn new(varmap: &VarMap, weight_decay: f64) -> Result<Self> {
-        let mut named: Vec<(String, Var)> = varmap
-            .data()
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        named.sort_by(|a, b| a.0.cmp(&b.0));
-        let (names, vars): (Vec<_>, Vec<_>) = named.into_iter().unzip();
-        let m = vars
-            .iter()
-            .map(|v| v.as_tensor().zeros_like())
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        let v = vars
-            .iter()
-            .map(|v| v.as_tensor().zeros_like())
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        Ok(Self {
-            names,
-            vars,
-            m,
-            v,
-            t: 0,
-            beta1: 0.9,
-            beta2: 0.95,
-            eps: 1e-8,
-            weight_decay,
-        })
-    }
-
-    pub fn step(&mut self, grads: &[Option<Tensor>], lr: f64) -> Result<()> {
-        self.t += 1;
-        let c1 = 1.0 - self.beta1.powi(self.t as i32);
-        let c2 = 1.0 - self.beta2.powi(self.t as i32);
-        for i in 0..self.vars.len() {
-            let Some(g) = &grads[i] else { continue };
-            let p = self.vars[i].as_tensor();
-            let m = ((&self.m[i] * self.beta1)? + (g * (1.0 - self.beta1))?)?;
-            let v = ((&self.v[i] * self.beta2)? + (g.sqr()? * (1.0 - self.beta2))?)?;
-            let update = ((&m / c1)? / ((&v / c2)?.sqrt()? + self.eps)?)?;
-            // Weight decay — только матрицам (не нормализациям).
-            let decay = if p.rank() >= 2 {
-                1.0 - lr * self.weight_decay
-            } else {
-                1.0
-            };
-            let new_p = ((p * decay)? - (update * lr)?)?;
-            self.vars[i].set(&new_p)?;
-            self.m[i] = m;
-            self.v[i] = v;
-        }
-        Ok(())
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let mut map = HashMap::new();
-        for (i, name) in self.names.iter().enumerate() {
-            map.insert(format!("m.{name}"), self.m[i].clone());
-            map.insert(format!("v.{name}"), self.v[i].clone());
-        }
-        map.insert("t".into(), Tensor::new(&[self.t as u32], &Device::Cpu)?);
-        checkpoint::save_tensors(&map, path)
-    }
-
-    pub fn load(&mut self, path: &Path, device: &Device) -> Result<()> {
-        let map = candle_core::safetensors::load(path, device)?;
-        for (i, name) in self.names.iter().enumerate() {
-            if let (Some(m), Some(v)) =
-                (map.get(&format!("m.{name}")), map.get(&format!("v.{name}")))
-            {
-                self.m[i] = m.to_dtype(self.vars[i].dtype())?;
-                self.v[i] = v.to_dtype(self.vars[i].dtype())?;
-            }
-        }
-        if let Some(t) = map.get("t") {
-            self.t = t.to_vec1::<u32>()?[0] as usize;
-        }
-        Ok(())
-    }
+pub fn adamw(weight_decay: f64, clip: f64) -> ModuleOptimizer {
+    AdamWConfig::new()
+        .with_beta_2(0.95)
+        .with_epsilon(1e-8)
+        .with_weight_decay(weight_decay as f32)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(clip as f32)))
+        .init()
 }
 
 /// Один шаг оптимизации: `accum` микро-батчей, градиенты суммируются,
-/// затем обрезка по норме и шаг AdamW. Возвращает (loss, норма градиента).
+/// затем обрезка по норме и шаг AdamW. `device` — устройство с autodiff.
 #[allow(clippy::too_many_arguments)]
 pub fn train_step(
-    model: &Model,
-    opt: &mut AdamW,
+    model: Model,
+    opt: &mut ModuleOptimizer,
     data: &mut dyn BatchSource,
     rng: &mut Rng,
+    device: &Device,
     micro_batch: usize,
     seq_len: usize,
     accum: usize,
     lr: f64,
-    clip: f64,
-) -> Result<(f32, f32)> {
-    let mut acc: Vec<Option<Tensor>> = vec![None; opt.vars.len()];
+) -> Result<(Model, f32)> {
+    let mut acc = GradientsAccumulator::new();
     let mut total_loss = 0.0f32;
     for _ in 0..accum {
-        let batch = data.next_batch(rng, micro_batch, seq_len, model.device())?;
-        let logits = model.forward(&batch.x, None, true)?;
-        let loss = lm_loss(&logits, &batch.y, batch.mask.as_ref())?;
-        total_loss += loss.to_scalar::<f32>()?;
-        let grads = (loss / accum as f64)?.backward()?;
-        for (i, var) in opt.vars.iter().enumerate() {
-            if let Some(g) = grads.get(var.as_tensor()) {
-                acc[i] = Some(match acc[i].take() {
-                    Some(a) => (a + g)?,
-                    None => g.clone(),
-                });
-            }
+        let batch = data.next_batch(rng, micro_batch, seq_len, device)?;
+        let logits = model.forward(batch.x, None)?;
+        let loss = lm_loss(logits, batch.y, batch.mask);
+        let value = loss.clone().into_scalar::<f32>();
+        if !value.is_finite() {
+            bail!("loss стал NaN/inf — уменьши learning rate");
         }
+        total_loss += value;
+        let grads = (loss / accum as f64).backward();
+        acc.accumulate(&model, GradientsParams::from_grads(grads, &model));
     }
-    let mut sq = Tensor::zeros((), DType::F32, model.device())?;
-    for g in acc.iter().flatten() {
-        sq = (sq + g.to_dtype(DType::F32)?.sqr()?.sum_all()?)?;
-    }
-    let norm = sq.sqrt()?.to_scalar::<f32>()?;
-    if !norm.is_finite() {
-        bail!("градиент стал NaN/inf — уменьши learning rate");
-    }
-    if norm as f64 > clip {
-        let s = clip / (norm as f64 + 1e-6);
-        for g in acc.iter_mut().flatten() {
-            *g = (&*g * s)?;
-        }
-    }
-    opt.step(&acc, lr)?;
-    Ok((total_loss / accum as f32, norm))
+    let model = opt.step(lr, model, acc.grads());
+    Ok((model, total_loss / accum as f32))
 }
 
+/// Средний loss на проверочных данных. `model` — копия без autodiff (`valid()`).
 pub fn eval_loss(
     model: &Model,
     data: &mut dyn BatchSource,
     rng: &mut Rng,
+    device: &Device,
     batch: usize,
     seq_len: usize,
     iters: usize,
 ) -> Result<f32> {
     let mut total = 0.0;
     for _ in 0..iters {
-        let b = data.next_batch(rng, batch, seq_len, model.device())?;
-        let logits = model.forward(&b.x, None, false)?;
-        total += lm_loss(&logits, &b.y, b.mask.as_ref())?.to_scalar::<f32>()?;
+        let b = data.next_batch(rng, batch, seq_len, device)?;
+        let logits = model.forward(b.x, None)?;
+        total += lm_loss(logits, b.y, b.mask).into_scalar::<f32>();
     }
     Ok(total / iters as f32)
 }
@@ -218,12 +118,10 @@ pub struct TrainArgs {
     pub eval_every: usize,
     #[arg(long, default_value_t = 1000)]
     pub save_every: usize,
-    /// f32 (точнее) или bf16 (быстрее и меньше памяти, RTX 30xx и новее).
-    #[arg(long, default_value = "f32")]
-    pub dtype: String,
     /// Начать оптимизатор и счётчик шагов заново (например, при переходе к SFT).
     #[arg(long)]
     pub fresh: bool,
+    /// Обучать на процессоре, даже если есть видеокарта.
     #[arg(long)]
     pub cpu: bool,
     #[arg(long, default_value_t = 1337)]
@@ -231,10 +129,10 @@ pub struct TrainArgs {
 }
 
 pub fn run(args: TrainArgs) -> Result<()> {
-    let device = pick_device(args.cpu)?;
-    let dtype = parse_dtype(&args.dtype, &device)?;
-    let loaded = checkpoint::load(&args.model, &device, dtype)?;
-    let (model, varmap, tok, cfg) = (loaded.model, loaded.varmap, loaded.tokenizer, loaded.cfg);
+    let (device, _) = pick_device(args.cpu);
+    let train_device = device.clone().autodiff();
+    let loaded = checkpoint::load(&args.model, &train_device)?;
+    let (mut model, tok, cfg) = (loaded.model, loaded.tokenizer, loaded.cfg);
     let seq_len = args.seq_len.unwrap_or(cfg.max_seq_len).min(cfg.max_seq_len);
 
     let (mut train_data, mut val_data): (Box<dyn BatchSource>, Option<Box<dyn BatchSource>>) =
@@ -269,7 +167,7 @@ pub fn run(args: TrainArgs) -> Result<()> {
             _ => bail!("укажи либо --data (предобучение), либо --sft (диалоги)"),
         };
 
-    let mut opt = AdamW::new(&varmap, args.weight_decay)?;
+    let mut opt = adamw(args.weight_decay, args.clip);
     let mut state = if args.fresh {
         TrainState::default()
     } else {
@@ -277,7 +175,9 @@ pub fn run(args: TrainArgs) -> Result<()> {
     };
     let opt_path = args.model.join(checkpoint::OPTIMIZER);
     if !args.fresh && opt_path.exists() {
-        opt.load(&opt_path, &device)?;
+        opt = opt
+            .load(&opt_path)
+            .map_err(|e| anyhow!("не удалось загрузить оптимизатор: {e:?}"))?;
         println!(
             "Продолжаю с шага {} (видела {} токенов)",
             state.step,
@@ -286,9 +186,8 @@ pub fn run(args: TrainArgs) -> Result<()> {
     }
 
     println!(
-        "Модель: {} параметров | {:?} | контекст {seq_len} | батч {}×{} | lr {}",
+        "Модель: {} параметров | контекст {seq_len} | батч {}×{} | lr {}",
         human_count(cfg.n_params()),
-        dtype,
         args.micro_batch,
         args.accum,
         args.lr
@@ -301,9 +200,9 @@ pub fn run(args: TrainArgs) -> Result<()> {
     let mut t0 = Instant::now();
     let mut log_loss = 0.0;
     let mut log_n = 0;
-    let save = |state: &TrainState, opt: &AdamW| -> Result<()> {
-        checkpoint::save_weights(&args.model, &varmap)?;
-        opt.save(&opt_path)?;
+    let save = |state: &TrainState, model: &Model, opt: &ModuleOptimizer| -> Result<()> {
+        checkpoint::save_weights(&args.model, model)?;
+        checkpoint::save_optimizer(&args.model, opt)?;
         checkpoint::save_state(&args.model, state)?;
         Ok(())
     };
@@ -316,17 +215,18 @@ pub fn run(args: TrainArgs) -> Result<()> {
             args.lr,
             args.lr * args.min_lr_ratio,
         );
-        let (loss, norm) = train_step(
-            &model,
+        let (m, loss) = train_step(
+            model,
             &mut opt,
             train_data.as_mut(),
             &mut rng,
+            &train_device,
             args.micro_batch,
             seq_len,
             args.accum,
             lr,
-            args.clip,
         )?;
+        model = m;
         state.step = step + 1;
         state.tokens_seen += tokens_per_step;
         log_loss += loss;
@@ -335,10 +235,9 @@ pub fn run(args: TrainArgs) -> Result<()> {
         if state.step % 10 == 0 || state.step == end_step {
             let dt = t0.elapsed().as_secs_f64();
             println!(
-                "шаг {:>7} | loss {:.4} | grad {:.2} | lr {:.2e} | {:.0} ток/с",
+                "шаг {:>7} | loss {:.4} | lr {:.2e} | {:.0} ток/с",
                 state.step,
                 log_loss / log_n as f32,
-                norm,
                 lr,
                 (tokens_per_step * log_n as u64) as f64 / dt
             );
@@ -350,9 +249,10 @@ pub fn run(args: TrainArgs) -> Result<()> {
             && state.step % args.eval_every == 0
         {
             let vl = eval_loss(
-                &model,
+                &model.valid(),
                 val.as_mut(),
                 &mut Rng::new(0),
+                &device,
                 args.micro_batch,
                 seq_len,
                 20,
@@ -365,12 +265,12 @@ pub fn run(args: TrainArgs) -> Result<()> {
             t0 = Instant::now();
         }
         if state.step % args.save_every == 0 {
-            save(&state, &opt)?;
+            save(&state, &model, &opt)?;
             println!("  ✓ сохранено в {}", args.model.display());
             t0 = Instant::now();
         }
     }
-    save(&state, &opt)?;
+    save(&state, &model, &opt)?;
     println!("Готово. Модель сохранена в {}", args.model.display());
     Ok(())
 }

@@ -1,7 +1,7 @@
 # 🧠 Ишка — своя нейросеть для программирования
 
 Нейросеть-трансформер, написанная **с нуля на Rust**: свой токенизатор, своя модель (архитектура как у Llama),
-своё обучение на видеокарте NVIDIA и веб-чат, через который ты учишь её прямо в браузере.
+своё обучение на видеокарте (NVIDIA, AMD или Intel — без CUDA) и веб-чат, через который ты учишь её прямо в браузере.
 
 - **Модель:** декодер-трансформер (RMSNorm, RoPE, SwiGLU), размеры от 1.4M до 520M параметров.
   Пресет `base` весит **~1 ГБ** (240M параметров).
@@ -25,36 +25,23 @@
 
 ## 1. Установка
 
-1. Установи Rust: <https://rustup.rs>.
-2. Установи драйвер NVIDIA и **CUDA Toolkit** 12.x или 13.x: <https://developer.nvidia.com/cuda-downloads>.
-   Проверка: команда `nvcc --version` должна работать.
-3. Собери программу с поддержкой видеокарты:
+Нужен только **Rust** (<https://rustup.rs>) и обычный драйвер видеокарты.
+CUDA Toolkit, Visual Studio для CUDA и прочие SDK **не нужны**: с видеокартой Ишка работает через
+[wgpu](https://wgpu.rs) (DirectX 12 / Vulkan / Metal), а все библиотеки Rust скачает сам.
 
 ```bash
-cargo build --release --features cuda
+cargo build --release
 ```
 
 Программа появится в `target/release/ishka` (на Windows `target\release\ishka.exe`).
 В командах ниже она для краткости называется просто `ishka`.
-Без `--features cuda` всё тоже работает, но на процессоре, то есть очень медленно.
+В PowerShell запускай с точкой впереди: `.\target\release\ishka.exe …`
 
-### Windows: важно
+При запуске программа пишет, где работает:
+- `✓ Работаю на видеокарте (wgpu).` — всё хорошо;
+- `⚠ Видеокарта недоступна … Работаю на процессоре` — обнови драйвер видеокарты. Всё будет работать, но медленно.
 
-**Проще всего:** запусти из PowerShell в папке проекта `.\build-windows.bat 89` (число — архитектура видеокарты, см. ниже).
-Скрипт сам найдёт Visual Studio, подключит компилятор C++ и соберёт программу с CUDA.
-
-Если собираешь вручную:
-
-- Собирай **не в обычном PowerShell**, а в **«x64 Native Tools Command Prompt for VS»** (найди через Пуск).
-  Иначе будет ошибка `nvcc fatal: Cannot find compiler 'cl.exe' in PATH`. Проверка: `where cl` должна найти файл.
-  Если такого ярлыка нет, доустанови Visual Studio Build Tools с компонентом «Разработка классических приложений на C++».
-- Номер архитектуры видеокарты задаётся так (RTX 20xx → 75, 30xx → 86, 40xx → 89, 50xx → 120):
-  - в «Command Prompt» (cmd): `set CUDA_COMPUTE_CAP=89`
-  - в PowerShell: `$env:CUDA_COMPUTE_CAP="89"` (команда `set` там **не работает**)
-- Запуск программы: в cmd `target\release\ishka.exe …`, в PowerShell `.\target\release\ishka.exe …`.
-- Если nvcc ругается на неподдерживаемую версию Visual Studio: `set NVCC_APPEND_FLAGS=-allow-unsupported-compiler`.
-- CUDA 13 при ручной сборке: `set NVCC_APPEND_FLAGS=-Xcompiler /Zc:preprocessor`, иначе ошибка
-  `C1189 … traditional preprocessor` (скрипт `build-windows.bat` делает это сам).
+Флаг `--cpu` заставляет работать на процессоре, даже если видеокарта есть.
 
 ## 2. Собери данные (код, на котором она будет учиться)
 
@@ -101,11 +88,10 @@ ishka train --data data/pretrain --steps 50000
 
 | Видеопамять | Параметры для `base` |
 |---|---|
-| 8 ГБ | `--micro-batch 1 --accum 32 --seq-len 512 --dtype bf16` |
-| 12 ГБ | `--micro-batch 2 --accum 16 --seq-len 1024 --dtype bf16` |
+| 8 ГБ | `--micro-batch 1 --accum 32 --seq-len 512` |
+| 12 ГБ | `--micro-batch 2 --accum 16 --seq-len 1024` |
 | 24 ГБ | `--micro-batch 8 --accum 4` |
 
-`--dtype bf16` ускоряет обучение и экономит память на RTX 30xx/40xx/50xx.
 
 Проверить, что получилось:
 ```bash

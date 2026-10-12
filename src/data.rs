@@ -4,7 +4,7 @@ use crate::chat::{self, Message};
 use crate::tokenizer::Tokenizer;
 use crate::util::Rng;
 use anyhow::{Context, Result, bail};
-use candle_core::{Device, Tensor};
+use burn::prelude::{Device, Int, Tensor, TensorData};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -82,9 +82,14 @@ pub fn read_documents(path: &Path, max_file_bytes: u64) -> Vec<String> {
 }
 
 pub struct Batch {
-    pub x: Tensor,
-    pub y: Tensor,
-    pub mask: Option<Tensor>,
+    pub x: Tensor<2, Int>,
+    pub y: Tensor<2, Int>,
+    pub mask: Option<Tensor<2>>,
+}
+
+fn ids_tensor(ids: Vec<u32>, batch: usize, t: usize, dev: &Device) -> Tensor<2, Int> {
+    let ids: Vec<i64> = ids.into_iter().map(i64::from).collect();
+    Tensor::from_data(TensorData::new(ids, [batch, t]), dev)
 }
 
 pub trait BatchSource {
@@ -142,8 +147,8 @@ impl BatchSource for TokenFile {
             ys.extend((start + 1..start + seq_len + 1).map(|i| self.get(i)));
         }
         Ok(Batch {
-            x: Tensor::from_vec(xs, (batch, seq_len), dev)?,
-            y: Tensor::from_vec(ys, (batch, seq_len), dev)?,
+            x: ids_tensor(xs, batch, seq_len, dev),
+            y: ids_tensor(ys, batch, seq_len, dev),
             mask: None,
         })
     }
@@ -230,9 +235,9 @@ impl BatchSource for ChatData {
             }
         }
         Ok(Batch {
-            x: Tensor::from_vec(xs, (batch, t), dev)?,
-            y: Tensor::from_vec(ys, (batch, t), dev)?,
-            mask: Some(Tensor::from_vec(ms, (batch, t), dev)?),
+            x: ids_tensor(xs, batch, t, dev),
+            y: ids_tensor(ys, batch, t, dev),
+            mask: Some(Tensor::from_data(TensorData::new(ms, [batch, t]), dev)),
         })
     }
 }

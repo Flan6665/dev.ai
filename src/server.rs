@@ -6,8 +6,8 @@ use crate::data::ChatData;
 use crate::generate::{SamplingParams, generate};
 use crate::model::{Config, Model};
 use crate::tokenizer::{self as tk, StreamDecoder, Tokenizer};
-use crate::train::{AdamW, lr_at, train_step};
-use crate::util::{Rng, human_count, parse_dtype, pick_device};
+use crate::train::{adamw, lr_at, train_step};
+use crate::util::{Rng, human_count, pick_device};
 use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,8 +15,8 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use candle_core::{DType, Device};
-use candle_nn::VarMap;
+use burn::module::Module;
+use burn::prelude::Device;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
@@ -27,8 +27,10 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 struct Engine {
+    /// Модель с градиентами — её дообучаем.
     model: Model,
-    varmap: VarMap,
+    /// Её копия без градиентов — ей отвечаем (быстрее и меньше памяти).
+    infer: Model,
     tok: Tokenizer,
     cfg: Config,
 }
@@ -48,7 +50,8 @@ struct AppState {
     feedback: PathBuf,
     status: Mutex<TrainStatus>,
     device: Device,
-    dtype: DType,
+    train_device: Device,
+    gpu: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -62,24 +65,23 @@ pub struct ServeArgs {
     /// Куда сохранять примеры, которым ты учишь модель (по умолчанию <model>/feedback.jsonl).
     #[arg(long)]
     pub feedback: Option<PathBuf>,
-    #[arg(long, default_value = "f32")]
-    pub dtype: String,
+    /// Работать на процессоре, даже если есть видеокарта.
     #[arg(long)]
     pub cpu: bool,
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
-    let device = pick_device(args.cpu)?;
-    let dtype = parse_dtype(&args.dtype, &device)?;
-    let l = checkpoint::load(&args.model, &device, dtype)?;
+    let (device, gpu) = pick_device(args.cpu);
+    let train_device = device.clone().autodiff();
+    let l = checkpoint::load(&args.model, &train_device)?;
     let feedback = args
         .feedback
         .clone()
         .unwrap_or_else(|| args.model.join("feedback.jsonl"));
     let state = Arc::new(AppState {
         engine: Mutex::new(Engine {
+            infer: l.model.valid(),
             model: l.model,
-            varmap: l.varmap,
             tok: l.tokenizer,
             cfg: l.cfg,
         }),
@@ -87,7 +89,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         feedback,
         status: Mutex::new(TrainStatus::default()),
         device,
-        dtype,
+        train_device,
+        gpu,
     });
     let app = Router::new()
         .route(
@@ -125,8 +128,7 @@ async fn info(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "params": cfg.as_ref().map(|c| human_count(c.n_params())),
         "config": cfg,
-        "device": if st.device.is_cpu() { "CPU" } else { "GPU (CUDA)" },
-        "dtype": format!("{:?}", st.dtype),
+        "device": if st.gpu { "GPU" } else { "CPU" },
         "pretrain_steps": train_state.step,
         "tokens_seen": human_count(train_state.tokens_seen as usize),
         "examples": count_examples(&st.feedback),
@@ -174,7 +176,8 @@ async fn chat_handler(
         let mut decoder = StreamDecoder::default();
         let mut rng = Rng::from_time();
         let res = generate(
-            &engine.model,
+            &engine.infer,
+            &st.device,
             &prompt,
             &req.params,
             &mut rng,
@@ -298,7 +301,7 @@ async fn train_handler(
 }
 
 fn teach_model(st: &AppState, steps: usize, lr: f64) -> Result<()> {
-    let engine = st.engine.lock().unwrap();
+    let mut engine = st.engine.lock().unwrap();
     let mut data = ChatData::load_jsonl(&engine.tok, &st.feedback)?;
     let n = data.len();
     // Резервная копия весов до обучения — чтобы можно было откатиться.
@@ -309,29 +312,34 @@ fn teach_model(st: &AppState, steps: usize, lr: f64) -> Result<()> {
             st.model_dir.join("model.before-teach.safetensors"),
         )?;
     }
-    let mut opt = AdamW::new(&engine.varmap, 0.0)?;
+    let mut opt = adamw(0.0, 1.0);
     let mut rng = Rng::from_time();
     let micro_batch = n.clamp(1, 4);
+    let seq_len = engine.cfg.max_seq_len;
     st.status.lock().unwrap().message = format!("Учусь на {n} примерах…");
+    let mut model = engine.model.clone();
     for step in 0..steps {
         let cur_lr = lr_at(step, (steps / 10).max(1), steps, lr, lr * 0.1);
-        let (loss, _) = train_step(
-            &engine.model,
+        let (m, loss) = train_step(
+            model,
             &mut opt,
             &mut data,
             &mut rng,
+            &st.train_device,
             micro_batch,
-            engine.cfg.max_seq_len,
+            seq_len,
             1,
             cur_lr,
-            1.0,
         )?;
+        model = m;
         let mut s = st.status.lock().unwrap();
         s.step = step + 1;
         s.loss = Some(loss);
     }
     st.status.lock().unwrap().message = "Сохраняю…".into();
-    checkpoint::save_weights(&st.model_dir, &engine.varmap)?;
+    checkpoint::save_weights(&st.model_dir, &model)?;
+    engine.infer = model.valid();
+    engine.model = model;
     Ok(())
 }
 

@@ -1,5 +1,4 @@
-use anyhow::{Result, bail};
-use candle_core::{DType, Device};
+use burn::prelude::Device;
 
 /// Маленький быстрый ГПСЧ (SplitMix64) — для выборки батчей и семплирования.
 pub struct Rng(u64);
@@ -36,33 +35,25 @@ impl Rng {
     }
 }
 
-pub fn pick_device(cpu: bool) -> Result<Device> {
-    if cpu {
-        return Ok(Device::Cpu);
+/// Видеокарта через wgpu (DirectX 12 / Vulkan / Metal — нужен только обычный драйвер),
+/// а если её нет — процессор. Возвращает устройство и признак «это видеокарта».
+pub fn pick_device(cpu: bool) -> (Device, bool) {
+    if !cpu {
+        match Device::wgpu_options().init() {
+            Ok(dev) => {
+                eprintln!("✓ Работаю на видеокарте (wgpu).");
+                return (dev, true);
+            }
+            Err(e) => {
+                eprintln!("⚠ Видеокарта недоступна ({e:?}). Работаю на процессоре — это медленно.")
+            }
+        }
     }
-    let dev = Device::cuda_if_available(0)?;
-    if dev.is_cpu() {
-        eprintln!(
-            "⚠ Видеокарта не используется: собери с `--features cuda`, чтобы обучать на NVIDIA. Работаю на CPU."
-        );
-    } else {
-        eprintln!("✓ Работаю на видеокарте NVIDIA (CUDA).");
-    }
-    Ok(dev)
-}
-
-pub fn parse_dtype(s: &str, dev: &Device) -> Result<DType> {
-    let dt = match s {
-        "f32" => DType::F32,
-        "bf16" => DType::BF16,
-        "f16" => DType::F16,
-        _ => bail!("dtype должен быть f32 | bf16 | f16"),
-    };
-    if dt != DType::F32 && dev.is_cpu() {
-        eprintln!("⚠ {s} на CPU медленный, использую f32.");
-        return Ok(DType::F32);
-    }
-    Ok(dt)
+    // Burn кое-где (например, при загрузке состояния оптимизатора) берёт устройство «по умолчанию»,
+    // а оно — видеокарта. Без видеокарты указываем процессор явно.
+    // SAFETY: вызывается при старте, до того как другие потоки читают окружение.
+    unsafe { std::env::set_var("BURN_DEVICE", "flex") };
+    (Device::flex(), false)
 }
 
 pub fn human_count(n: usize) -> String {
