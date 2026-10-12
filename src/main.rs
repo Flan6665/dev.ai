@@ -110,10 +110,7 @@ fn cmd_tokenizer(
     sample_mb: usize,
     exts: String,
 ) -> Result<()> {
-    let mut files = data::collect_files(&input, &exts);
-    if files.is_empty() {
-        bail!("не нашёл файлов с расширениями {exts}");
-    }
+    let mut files = data::find_input_files(&input, &exts)?;
     // Перемешиваем, чтобы выборка была из разных проектов.
     let mut rng = Rng::new(7);
     for i in (1..files.len()).rev() {
@@ -190,10 +187,7 @@ fn cmd_prepare(
     if tok.vocab_size() > 65536 {
         bail!("словарь больше 65536 — не влезет в u16");
     }
-    let files = data::collect_files(&input, &exts);
-    if files.is_empty() {
-        bail!("не нашёл файлов с расширениями {exts}");
-    }
+    let files = data::find_input_files(&input, &exts)?;
     println!(
         "Файлов: {}. Токенизирую в {} потоков…",
         files.len(),

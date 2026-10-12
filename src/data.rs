@@ -49,6 +49,32 @@ pub fn collect_files(inputs: &[PathBuf], exts: &str) -> Vec<PathBuf> {
     files
 }
 
+/// Как `collect_files`, но с понятными ошибками, если папки нет или в ней нет кода.
+pub fn find_input_files(inputs: &[PathBuf], exts: &str) -> Result<Vec<PathBuf>> {
+    for input in inputs {
+        if !input.exists() {
+            let full = std::env::current_dir()
+                .map(|d| d.join(input))
+                .unwrap_or(input.clone());
+            bail!("папки {} не существует", full.display());
+        }
+    }
+    let files = collect_files(inputs, exts);
+    if files.is_empty() {
+        let list: Vec<String> = inputs
+            .iter()
+            .map(|p| p.canonicalize().unwrap_or(p.clone()).display().to_string())
+            .collect();
+        bail!(
+            "в {} нет файлов с кодом (ищу расширения: {exts}). Положи туда исходники, например: \
+             git clone --depth 1 https://github.com/tokio-rs/tokio",
+            list.join(", ")
+        );
+    }
+    println!("Нашёл {} файлов с кодом.", files.len());
+    Ok(files)
+}
+
 /// Документы из файла. Для .jsonl — по одному на строку (поле text/content/code),
 /// иначе весь файл целиком. Бинарные и огромные файлы пропускаются.
 pub fn read_documents(path: &Path, max_file_bytes: u64) -> Vec<String> {
