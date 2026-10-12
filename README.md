@@ -26,7 +26,7 @@
 ## 1. Установка
 
 1. Установи Rust: <https://rustup.rs>.
-2. Установи драйвер NVIDIA и **CUDA Toolkit** 12.x: <https://developer.nvidia.com/cuda-downloads>.
+2. Установи драйвер NVIDIA и **CUDA Toolkit** 12.x или 13.x: <https://developer.nvidia.com/cuda-downloads>.
    Проверка: команда `nvcc --version` должна работать.
 3. Собери программу с поддержкой видеокарты:
 
@@ -37,6 +37,17 @@ cargo build --release --features cuda
 Программа появится в `target/release/ishka` (на Windows `target\release\ishka.exe`).
 В командах ниже она для краткости называется просто `ishka`.
 Без `--features cuda` всё тоже работает, но на процессоре, то есть очень медленно.
+
+### Windows: важно
+
+- Собирай **не в обычном PowerShell**, а в **«x64 Native Tools Command Prompt for VS»** (найди через Пуск).
+  Иначе будет ошибка `nvcc fatal: Cannot find compiler 'cl.exe' in PATH`. Проверка: `where cl` должна найти файл.
+  Если такого ярлыка нет, доустанови Visual Studio Build Tools с компонентом «Разработка классических приложений на C++».
+- Номер архитектуры видеокарты задаётся так (RTX 20xx → 75, 30xx → 86, 40xx → 89, 50xx → 120):
+  - в «Command Prompt» (cmd): `set CUDA_COMPUTE_CAP=89`
+  - в PowerShell: `$env:CUDA_COMPUTE_CAP="89"` (команда `set` там **не работает**)
+- Запуск программы: в cmd `target\release\ishka.exe …`, в PowerShell `.\target\release\ishka.exe …`.
+- Если nvcc ругается на неподдерживаемую версию Visual Studio: `set NVCC_APPEND_FLAGS=-allow-unsupported-compiler`.
 
 ## 2. Собери данные (код, на котором она будет учиться)
 
