@@ -40,6 +40,11 @@ cargo build --release --features cuda
 
 ### Windows: важно
 
+**Проще всего:** запусти из PowerShell в папке проекта `.\build-windows.bat 89` (число — архитектура видеокарты, см. ниже).
+Скрипт сам найдёт Visual Studio, подключит компилятор C++ и соберёт программу с CUDA.
+
+Если собираешь вручную:
+
 - Собирай **не в обычном PowerShell**, а в **«x64 Native Tools Command Prompt for VS»** (найди через Пуск).
   Иначе будет ошибка `nvcc fatal: Cannot find compiler 'cl.exe' in PATH`. Проверка: `where cl` должна найти файл.
   Если такого ярлыка нет, доустанови Visual Studio Build Tools с компонентом «Разработка классических приложений на C++».
