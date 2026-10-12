@@ -14,6 +14,7 @@ set "VSDIR="
 for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
 if not defined VSDIR goto novs
 
+echo Скрипт сборки Ишки, версия 3
 echo [1/3] Подключаю компилятор C++ из: %VSDIR%
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 where cl >nul 2>nul
@@ -27,7 +28,11 @@ nvcc --version | findstr /i "release"
 echo [3/3] Собираю (первый раз 10-30 минут), CUDA_COMPUTE_CAP=%CAP%
 set "CUDA_COMPUTE_CAP=%CAP%"
 rem CUDA 13 требует стандартный препроцессор MSVC, иначе ошибка C1189 в cccl/preprocessor.h.
+rem Передаём флаг двумя путями: через nvcc и через переменную CL, которую cl.exe читает сам.
 set "NVCC_APPEND_FLAGS=%NVCC_APPEND_FLAGS% -Xcompiler /Zc:preprocessor"
+set "CL=/Zc:preprocessor %CL%"
+echo       NVCC_APPEND_FLAGS=%NVCC_APPEND_FLAGS%
+echo       CL=%CL%
 cargo build --release --features cuda
 if errorlevel 1 goto failed
 
