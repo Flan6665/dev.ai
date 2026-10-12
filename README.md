@@ -53,6 +53,8 @@ cargo build --release --features cuda
   - в PowerShell: `$env:CUDA_COMPUTE_CAP="89"` (команда `set` там **не работает**)
 - Запуск программы: в cmd `target\release\ishka.exe …`, в PowerShell `.\target\release\ishka.exe …`.
 - Если nvcc ругается на неподдерживаемую версию Visual Studio: `set NVCC_APPEND_FLAGS=-allow-unsupported-compiler`.
+- CUDA 13 при ручной сборке: `set NVCC_APPEND_FLAGS=-Xcompiler /Zc:preprocessor`, иначе ошибка
+  `C1189 … traditional preprocessor` (скрипт `build-windows.bat` делает это сам).
 
 ## 2. Собери данные (код, на котором она будет учиться)
 

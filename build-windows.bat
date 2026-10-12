@@ -26,6 +26,8 @@ nvcc --version | findstr /i "release"
 
 echo [3/3] Собираю (первый раз 10-30 минут), CUDA_COMPUTE_CAP=%CAP%
 set "CUDA_COMPUTE_CAP=%CAP%"
+rem CUDA 13 требует стандартный препроцессор MSVC, иначе ошибка C1189 в cccl/preprocessor.h.
+set "NVCC_APPEND_FLAGS=%NVCC_APPEND_FLAGS% -Xcompiler /Zc:preprocessor"
 cargo build --release --features cuda
 if errorlevel 1 goto failed
 
